@@ -14,8 +14,10 @@ const { exec } = require('child_process');
 const loginUrl = "https://app.tarc.edu.my/MobileService/studentLogin.jsp";
 const classTimetableUrl = "https://app.tarc.edu.my/MobileService/services/AJAXStudentTimetable.jsp?act=get&week=all";
 const examTimetableUrl = "https://app.tarc.edu.my/MobileService/services/AJAXExamTimetable.jsp?act=list&mversion=1";
+
 const deviceId = "92542A7E-B31D-461F-8B1C-15215824E3F9";
 const deviceModel = "MacBook Air M4 24GB RAM 512GB ROM";
+
 const username = process.env.TARUMT_USERNAME;
 const password = process.env.TARUMT_PASSWORD;
 // APP_SECRET is set in GitHub Actions workflow, fallback for local development
@@ -34,10 +36,8 @@ function createSignature(data, secret) {
 }
 
 async function login() {
-  // Generate timestamp
   const timestamp = Math.floor(Date.now() / 1000);
 
-  // Create params object
   const params = {
     username: username,
     password: password,
@@ -47,14 +47,12 @@ async function login() {
     fplatform: "ios"
   };
 
-  // Create signature data: key=value&key=value|timestamp (not URL encoded)
   const paramsString = Object.entries(params)
     .map(([key, value]) => `${key}=${value}`)
     .join('&');
   const signatureData = paramsString + '|' + timestamp;
   const signature = createSignature(signatureData, APP_SECRET);
 
-  // Create URLSearchParams for the actual request body
   const loginData = new URLSearchParams(params);
 
   const fetchOptions = {
@@ -94,10 +92,8 @@ async function login() {
 }
 
 async function getClassTimetable(token) {
-  // Generate timestamp
   const timestamp = Math.floor(Date.now() / 1000);
 
-  // Create signature for the request
   const params = { act: 'get', week: 'all' };
   const paramsString = Object.entries(params)
     .map(([key, value]) => `${key}=${value}`)
@@ -121,11 +117,8 @@ async function getClassTimetable(token) {
     const response = await fetch(classTimetableUrl, fetchOptions);
     const raw = await response.text();
     const match = raw.match(/{[\s\S]*}/);
-    if (!match) {
-      throw new Error("Class timetable response does not contain valid JSON");
-    }
-    const data = JSON.parse(match[0]);
-    return data;
+    if (!match) throw new Error("Class timetable response does not contain valid JSON");
+    return JSON.parse(match[0]);
   } catch (error) {
     log("Get class timetable error: " + error.message);
     return null;
@@ -133,10 +126,8 @@ async function getClassTimetable(token) {
 }
 
 async function getExamTimetable(token) {
-  // Generate timestamp
   const timestamp = Math.floor(Date.now() / 1000);
 
-  // Create signature for the request
   const params = { act: 'list', mversion: '1' };
   const paramsString = Object.entries(params)
     .map(([key, value]) => `${key}=${value}`)
@@ -160,15 +151,95 @@ async function getExamTimetable(token) {
     const response = await fetch(examTimetableUrl, fetchOptions);
     const raw = await response.text();
     const match = raw.match(/{[\s\S]*}/);
-    if (!match) {
-      throw new Error("Exam timetable response does not contain valid JSON");
-    }
-    const data = JSON.parse(match[0]);
-    return data;
+    if (!match) throw new Error("Exam timetable response does not contain valid JSON");
+    return JSON.parse(match[0]);
   } catch (error) {
     log("Get exam timetable error: " + error.message);
     return null;
   }
+}
+
+// Helper to parse week string, e.g. "all", "1-3,5,7-9"
+function parseWeeks(weekStr, allWeeks) {
+  if (weekStr === "all") return allWeeks.filter(w => w !== "all").map(Number);
+  return weekStr.split(',').flatMap(part => {
+    if (part.includes('-')) {
+      const [start, end] = part.split('-').map(Number);
+      return Array.from({ length: end - start + 1 }, (_, i) => start + i);
+    } else {
+      return [Number(part)];
+    }
+  });
+}
+
+function formatICSDate(date) {
+  const yyyy = date.getFullYear();
+  const mm = String(date.getMonth() + 1).padStart(2, '0');
+  const dd = String(date.getDate()).padStart(2, '0');
+  const hh = String(date.getHours()).padStart(2, '0');
+  const min = String(date.getMinutes()).padStart(2, '0');
+  const ss = "00";
+  return `${yyyy}${mm}${dd}T${hh}${min}${ss}`;
+}
+
+function convertTo24Hour(timeStr) {
+  const [time, modifier] = timeStr.split(" ");
+  let [hours, minutes] = time.split(":").map(Number);
+  if (modifier === "PM" && hours !== 12) hours += 12;
+  if (modifier === "AM" && hours === 12) hours = 0;
+  return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:00`;
+}
+
+/**
+ * ✅ FIXED: Do NOT hardcode year.
+ * - Try parse year from duration string first.
+ * - If missing year, infer based on "semester start month" and current month.
+ *
+ * Examples supported:
+ *  - "26 Jan"
+ *  - "26 Jan 2026"
+ *  - "26 Jan - 10 May 2026"
+ *  - "26 Jan 2026 - 10 May 2026"
+ */
+function extractSemesterStart(durationStr) {
+  if (!durationStr || durationStr.trim() === "") {
+    throw new Error("Duration string is empty - no timetable data available");
+  }
+
+  const match = durationStr.match(/^(\d{1,2})\s([A-Za-z]{3})(?:\s(\d{4}))?/);
+  if (!match) {
+    throw new Error(`Unable to parse semester start date from: "${durationStr}"`);
+  }
+
+  const day = parseInt(match[1], 10);
+  const month = match[2];
+  const yearInStr = match[3] ? parseInt(match[3], 10) : null;
+
+  const monthMap = {
+    Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4, Jun: 5,
+    Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11
+  };
+
+  if (!(month in monthMap)) {
+    throw new Error(`Unknown month "${month}" in duration: "${durationStr}"`);
+  }
+
+  let year;
+  if (yearInStr) {
+    year = yearInStr;
+  } else {
+    const now = new Date();
+    const startMonth = monthMap[month];
+    year = now.getFullYear();
+
+    // If semester starts in Jan-Jun and now is Aug-Dec, it's likely next year
+    if (startMonth <= 5 && now.getMonth() >= 7) {
+      year += 1;
+    }
+  }
+
+  // ✅ IMPORTANT: set to 12:00 to avoid timezone/UTC shifting the date
+  return new Date(year, monthMap[month], day, 12, 0, 0);
 }
 
 async function generateICS(classTimetable, examTimetable) {
@@ -184,19 +255,22 @@ async function generateICS(classTimetable, examTimetable) {
       if (!day.class) continue;
 
       for (const cls of day.class) {
-        // Use fweedur if present, otherwise "all"
         const weekList = parseWeeks(cls.fweedur || "all", classTimetable.weeks);
 
         for (const week of weekList) {
-          // Calculate the date for this week and day of week
           const baseDate = new Date(semesterStart);
 
-          // ✅ FIX: use (dow - 1) to align Monday correctly
+          // ✅ FIX: use (dow - 1) so Monday aligns correctly
           baseDate.setDate(baseDate.getDate() + (week - 1) * 7 + (dow - 1));
 
-          const baseDateStr = baseDate.toISOString().split("T")[0];
-          const startDateTime = new Date(baseDateStr + "T" + convertTo24Hour(cls.fstart));
-          const endDateTime = new Date(baseDateStr + "T" + convertTo24Hour(cls.fend));
+          // ✅ FIX: do NOT use toISOString() to derive date (UTC shift causes -1 day)
+          const y = baseDate.getFullYear();
+          const m = String(baseDate.getMonth() + 1).padStart(2, '0');
+          const d = String(baseDate.getDate()).padStart(2, '0');
+          const baseDateStr = `${y}-${m}-${d}`;
+
+          const startDateTime = new Date(`${baseDateStr}T${convertTo24Hour(cls.fstart)}`);
+          const endDateTime = new Date(`${baseDateStr}T${convertTo24Hour(cls.fend)}`);
 
           const event = [
             "BEGIN:VEVENT",
@@ -214,6 +288,7 @@ async function generateICS(classTimetable, examTimetable) {
         }
       }
     }
+
     log(`Added ${events.length} class events`);
   } else {
     log("No class timetable data available yet. Skipping class schedule.");
@@ -260,7 +335,6 @@ async function generateICS(classTimetable, examTimetable) {
     console.log("No exam timetable data available yet. Exams may not be scheduled.");
   }
 
-  // Only generate ICS file if we have at least some events
   if (events.length > 0) {
     const icsContent = [
       "BEGIN:VCALENDAR",
@@ -281,57 +355,21 @@ async function generateICS(classTimetable, examTimetable) {
   }
 }
 
-// Helper to parse week string, e.g. "all", "1-3,5,7-9"
-function parseWeeks(weekStr, allWeeks) {
-  if (weekStr === "all") return allWeeks.filter(w => w !== "all").map(Number);
-  return weekStr.split(',').flatMap(part => {
-    if (part.includes('-')) {
-      const [start, end] = part.split('-').map(Number);
-      return Array.from({ length: end - start + 1 }, (_, i) => start + i);
-    } else {
-      return [Number(part)];
-    }
-  });
-}
-
-function formatICSDate(date) {
-  const yyyy = date.getFullYear();
-  const mm = String(date.getMonth() + 1).padStart(2, '0');
-  const dd = String(date.getDate()).padStart(2, '0');
-  const hh = String(date.getHours()).padStart(2, '0');
-  const min = String(date.getMinutes()).padStart(2, '0');
-  const ss = "00";
-  return `${yyyy}${mm}${dd}T${hh}${min}${ss}`;
-}
-
-function convertTo24Hour(timeStr) {
-  const [time, modifier] = timeStr.split(" ");
-  let [hours, minutes] = time.split(":").map(Number);
-  if (modifier === "PM" && hours !== 12) hours += 12;
-  if (modifier === "AM" && hours === 12) hours = 0;
-  return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:00`;
-}
-
 async function main() {
   try {
-    // Validate credentials
     if (!username || !password) {
       log("ERROR: Missing credentials. Please set TARUMT_USERNAME and TARUMT_PASSWORD environment variables.");
       console.error("ERROR: Missing credentials. Please set TARUMT_USERNAME and TARUMT_PASSWORD environment variables.");
       process.exit(0); // Exit gracefully to avoid failing GitHub Actions
     }
 
-    //login and get the x-auth-token
     const token = await login();
     if (token) {
-      // Get both class and exam timetables
       const classTimetable = await getClassTimetable(token);
       const examTimetable = await getExamTimetable(token);
 
-      // Generate combined ICS file
       await generateICS(classTimetable, examTimetable);
 
-      // Only open on macOS when running locally (not in GitHub Actions)
       if (process.platform === 'darwin' && !process.env.GITHUB_ACTIONS) {
         exec('open timetable.ics');
       }
@@ -340,12 +378,12 @@ async function main() {
     } else {
       log("Login failed - unable to retrieve authentication token");
       console.error("Login failed. Please check your credentials.");
-      process.exit(0); // Exit gracefully
+      process.exit(0);
     }
   } catch (error) {
     log(`ERROR in main: ${error.message}`);
     console.error(`ERROR: ${error.message}`);
-    process.exit(0); // Exit gracefully to avoid failing GitHub Actions
+    process.exit(0);
   }
 }
 
@@ -354,56 +392,3 @@ main();
 process.on('exit', () => {
   logStream.end();
 });
-
-/**
- * ✅ FIXED: Do NOT hardcode year.
- * - Try parse year from duration string first.
- * - If missing year, infer based on "semester start month" and current month.
- *
- * Examples supported:
- *  - "26 Jan"
- *  - "26 Jan 2026"
- *  - "26 Jan - 10 May 2026"
- *  - "26 Jan 2026 - 10 May 2026"
- */
-function extractSemesterStart(durationStr) {
-  if (!durationStr || durationStr.trim() === "") {
-    throw new Error("Duration string is empty - no timetable data available");
-  }
-
-  // match: day, month, optional year
-  const match = durationStr.match(/^(\d{1,2})\s([A-Za-z]{3})(?:\s(\d{4}))?/);
-  if (!match) {
-    throw new Error(`Unable to parse semester start date from: "${durationStr}"`);
-  }
-
-  const day = parseInt(match[1], 10);
-  const month = match[2];
-  const yearInStr = match[3] ? parseInt(match[3], 10) : null;
-
-  const monthMap = {
-    Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4, Jun: 5,
-    Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11
-  };
-
-  if (!(month in monthMap)) {
-    throw new Error(`Unknown month "${month}" in duration: "${durationStr}"`);
-  }
-
-  let year;
-  if (yearInStr) {
-    year = yearInStr;
-  } else {
-    // Infer year when missing
-    const now = new Date();
-    const startMonth = monthMap[month];
-    year = now.getFullYear();
-
-    // If semester starts in Jan-Jun and now is Aug-Dec, it's likely next year
-    if (startMonth <= 5 && now.getMonth() >= 7) {
-      year += 1;
-    }
-  }
-
-  return new Date(year, monthMap[month], day);
-}
